@@ -55,6 +55,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearFetchCache();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -250,5 +252,70 @@ describe('fetchCached transport failures', () => {
 
     expect(again.cached).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('normalizes host casing when looking up cached responses', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ page: { name: 'Vendor' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const first = await fetchJsonCached(
+      'https://WWW.GitHubStatus.com/api/v2/summary.json',
+      60_000,
+      5_000,
+    );
+    const second = await fetchJsonCached(
+      'https://www.githubstatus.com/api/v2/summary.json',
+      60_000,
+      5_000,
+    );
+
+    expect(first.cached).toBe(false);
+    expect(second.cached).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('evicts the least recently used response when the cache reaches its entry limit', async () => {
+    const urls = Array.from({ length: 101 }, () => freshUrl());
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ page: { name: 'Vendor' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    for (const url of urls.slice(0, 100)) {
+      await fetchJsonCached(url, 60_000, 5_000);
+    }
+    const refreshed = await fetchJsonCached(urls[0]!, 60_000, 5_000);
+    await fetchJsonCached(urls[100]!, 60_000, 5_000);
+    const retained = await fetchJsonCached(urls[0]!, 60_000, 5_000);
+    const evicted = await fetchJsonCached(urls[1]!, 60_000, 5_000);
+
+    expect(refreshed.cached).toBe(true);
+    expect(retained.cached).toBe(true);
+    expect(evicted.cached).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(102);
+  });
+
+  it('sweeps expired responses when another cached URL is read', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+
+    const oldestUrl = freshUrl();
+    const expiredUrl = freshUrl();
+    const fillUrls = Array.from({ length: 98 }, () => freshUrl());
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ page: { name: 'Vendor' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchJsonCached(oldestUrl, 60_000, 5_000);
+    await fetchJsonCached(expiredUrl, 50, 5_000);
+    for (const url of fillUrls) {
+      await fetchJsonCached(url, 60_000, 5_000);
+    }
+
+    vi.advanceTimersByTime(51);
+    const unrelated = await fetchJsonCached(fillUrls[0]!, 60_000, 5_000);
+    await fetchJsonCached(freshUrl(), 60_000, 5_000);
+    const retained = await fetchJsonCached(oldestUrl, 60_000, 5_000);
+
+    expect(unrelated.cached).toBe(true);
+    expect(retained.cached).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(101);
   });
 });

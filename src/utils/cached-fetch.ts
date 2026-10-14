@@ -19,6 +19,7 @@ import { assertSafeUrl, ssrfRejectionMessage } from './ssrf-guard.js';
 
 /** Redirect hops followed before the chain is treated as an upstream fault. */
 const MAX_REDIRECTS = 5;
+const MAX_CACHE_ENTRIES = 100;
 
 interface CacheEntry<T> {
   expiresAt: number;
@@ -28,17 +29,34 @@ interface CacheEntry<T> {
 /** Shared in-memory cache across all tenants — vendor status data is public. */
 const CACHE = new Map<string, CacheEntry<unknown>>();
 
+function pruneExpiredEntries(now: number): void {
+  for (const [key, entry] of CACHE) {
+    if (now > entry.expiresAt) CACHE.delete(key);
+  }
+}
+
 function cacheGet<T>(key: string): T | null {
   const entry = CACHE.get(key) as CacheEntry<T> | undefined;
-  if (!entry || Date.now() > entry.expiresAt) {
-    CACHE.delete(key);
-    return null;
-  }
+  const now = Date.now();
+  pruneExpiredEntries(now);
+  if (!entry || now > entry.expiresAt) return null;
+
+  CACHE.delete(key);
+  CACHE.set(key, entry);
   return entry.value;
 }
 
 function cacheSet<T>(key: string, value: T, ttlMs: number): void {
-  CACHE.set(key, { value, expiresAt: Date.now() + ttlMs });
+  const now = Date.now();
+  pruneExpiredEntries(now);
+  CACHE.delete(key);
+  CACHE.set(key, { value, expiresAt: now + ttlMs });
+
+  while (CACHE.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = CACHE.keys().next().value;
+    if (oldestKey === undefined) break;
+    CACHE.delete(oldestKey);
+  }
 }
 
 /**
@@ -109,7 +127,19 @@ export async function fetchCached<T>(
   timeoutMs: number,
   parse: (res: Response) => Promise<T>,
 ): Promise<{ data: T; cached: boolean }> {
-  const cached = cacheGet<T>(url);
+  let cacheKey: string;
+  try {
+    cacheKey = new URL(url).href;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw serviceUnavailable(
+      `Could not reach ${url}: ${detail}`,
+      { reason: 'statuspage_unavailable', url },
+      { cause: err },
+    );
+  }
+
+  const cached = cacheGet<T>(cacheKey);
   if (cached !== null) return { data: cached, cached: true };
 
   const controller = new AbortController();
@@ -140,7 +170,7 @@ export async function fetchCached<T>(
       );
     }
 
-    cacheSet(url, data, ttlMs);
+    cacheSet(cacheKey, data, ttlMs);
     return { data, cached: false };
   } catch (err) {
     if (err instanceof McpError) throw err;
